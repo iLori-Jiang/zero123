@@ -495,6 +495,9 @@ class LatentDiffusion(DDPM):
                  scale_by_std=False,
                  unet_trainable=True,
                  *args, **kwargs):
+        
+        # JHY: NOTE: first_stage_config 和 cond_stage_config：分别为初级阶段模型（如 VAE）和条件阶段模型的配置。
+
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
         assert self.num_timesteps_cond <= kwargs['timesteps']
@@ -522,11 +525,15 @@ class LatentDiffusion(DDPM):
         self.instantiate_cond_stage(cond_stage_config)
         self.cond_stage_forward = cond_stage_forward
 
+        # JHY: NOTE
         # construct linear projection layer for concatenating image CLIP embedding and RT
         self.cc_projection = nn.Linear(772, 768)
+        # W [768, 772] get the [0:768, 0:768] to initialize as a eye matrix
         nn.init.eye_(list(self.cc_projection.parameters())[0][:768, :768])
+        # b [768, 1] initialize as all 0
         nn.init.zeros_(list(self.cc_projection.parameters())[1])
         self.cc_projection.requires_grad_(True)
+        # 这种初始化方式意味着，如果忽略多余的 4 个输入特征（772-768=4），线性层初始时对输入的前 768 维特征是一个单位映射，不改变输入。
         
         self.clip_denoised = False
         self.bbox_tokenizer = None
@@ -568,6 +575,8 @@ class LatentDiffusion(DDPM):
             self.make_cond_schedule()
 
     def instantiate_first_stage(self, config):
+        # 第一阶段模型：通常是一个 VAE 模型，用于将图像编码为潜在表示并解码回图像。
+
         model = instantiate_from_config(config)
         self.first_stage_model = model.eval()
         self.first_stage_model.train = disabled_train
@@ -575,6 +584,7 @@ class LatentDiffusion(DDPM):
             param.requires_grad = False
 
     def instantiate_cond_stage(self, config):
+        # Second stage: conditional model
         if not self.cond_stage_trainable:
             if config == "__is_first_stage__":
                 print("Using first stage also as cond stage.")
@@ -729,26 +739,35 @@ class LatentDiffusion(DDPM):
             x = x[:bs]
             T = T[:bs].to(self.device)
 
+        # Encode image by VAE to latent
         x = x.to(self.device)
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach()
+
+        # conditioning image
         cond_key = cond_key or self.cond_stage_key
         xc = super().get_input(batch, cond_key).to(self.device)
         if bs is not None:
             xc = xc[:bs]
         cond = {}
 
+        # JHY: NOTE
         # To support classifier-free guidance, randomly drop out only text conditioning 5%, only image conditioning 5%, and both 5%.
+        # 随机掩码用于无条件指导
         random = torch.rand(x.size(0), device=x.device)
         prompt_mask = rearrange(random < 2 * uncond, "n -> n 1 1")
         input_mask = 1 - rearrange((random >= uncond).float() * (random < 3 * uncond).float(), "n -> n 1 1 1")
         null_prompt = self.get_learned_conditioning([""])
 
+        # JHY: NOTE:
         # z.shape: [8, 4, 64, 64]; c.shape: [8, 1, 768]
         # print('=========== xc shape ===========', xc.shape)
         with torch.enable_grad():
+            # encode conditioning image into embedding (by CLIP)
             clip_emb = self.get_learned_conditioning(xc).detach()
             null_prompt = self.get_learned_conditioning([""]).detach()
+            # concate conditioning image embedding with T (camera parameter, which already have been processed in the dataset)
+            # then pass through a linear projection layer
             cond["c_crossattn"] = [self.cc_projection(torch.cat([torch.where(prompt_mask, null_prompt, clip_emb), T[:, None, :]], dim=-1))]
         cond["c_concat"] = [input_mask * self.encode_first_stage((xc.to(self.device))).mode().detach()]
         out = [z, cond]
@@ -865,6 +884,9 @@ class LatentDiffusion(DDPM):
         return loss
 
     def forward(self, x, c, *args, **kwargs):
+        # JHY: NOTE: computing loss
+
+        # 随机选择时间步：在扩散过程中随机选择一个时间步 t
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         if self.model.conditioning_key is not None:
             assert c is not None
@@ -873,6 +895,8 @@ class LatentDiffusion(DDPM):
             if self.shorten_cond_schedule:  # TODO: drop this option
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
+
+        # 损失计算：调用 p_losses 计算损失，训练过程中通过这个损失进行反向传播。
         return self.p_losses(x, c, t, *args, **kwargs)
 
     def _rescale_annotations(self, bboxes, crop_coordinates):  # TODO: move to dataset
@@ -886,20 +910,26 @@ class LatentDiffusion(DDPM):
         return [rescale_bbox(b) for b in bboxes]
 
     def apply_model(self, x_noisy, t, cond, return_ids=False):
+        # JHY: NOTE: key of the generating
 
         if isinstance(cond, dict):
             # hybrid case, cond is exptected to be a dict
+            # 如果 cond 是一个字典（混合条件情况）
             pass
         else:
+            # 如果 cond 不是列表，将其转化为列表
             if not isinstance(cond, list):
                 cond = [cond]
             key = 'c_concat' if self.model.conditioning_key == 'concat' else 'c_crossattn'
             cond = {key: cond}
 
+        # 处理大图像块的分割和条件
         if hasattr(self, "split_input_params"):
             assert len(cond) == 1  # todo can only deal with one conditioning atm
             assert not return_ids
+            # 核尺寸（如 128x128）
             ks = self.split_input_params["ks"]  # eg. (128, 128)
+            # 步幅（如 64x64）
             stride = self.split_input_params["stride"]  # eg. (64, 64)
 
             h, w = x_noisy.shape[-2:]
@@ -907,7 +937,8 @@ class LatentDiffusion(DDPM):
             fold, unfold, normalization, weighting = self.get_fold_unfold(x_noisy, ks, stride)
 
             z = unfold(x_noisy)  # (bn, nc * prod(**ks), L)
-            # Reshape to img shape
+
+            # Reshape to img shape # 重塑为图像形状
             z = z.view((z.shape[0], -1, ks[0], ks[1], z.shape[-1]))  # (bn, nc, ks[0], ks[1], L )
             z_list = [z[:, :, :, :, i] for i in range(z.shape[-1])]
 
@@ -964,10 +995,13 @@ class LatentDiffusion(DDPM):
                 cond_list = [cond for i in range(z.shape[-1])]  # Todo make this more efficient
 
             # apply model by loop over crops
+            # 逐块应用模型
+            # 应用模型：对每个图像块 z_list，结合其对应的条件 cond_list 和时间步 t，调用模型生成输出。
             output_list = [self.model(z_list[i], t, **cond_list[i]) for i in range(z.shape[-1])]
             assert not isinstance(output_list[0],
                                   tuple)  # todo cant deal with multiple model outputs check this never happens
 
+            # 合并输出：将所有块的输出堆叠起来，并结合权重 weighting，将其重新组合为完整图像 x_recon。
             o = torch.stack(output_list, axis=-1)
             o = o * weighting
             # Reverse reshape to img shape
@@ -976,6 +1010,7 @@ class LatentDiffusion(DDPM):
             x_recon = fold(o) / normalization
 
         else:
+            # 直接应用模型（不分块）
             x_recon = self.model(x_noisy, t, **cond)
 
         if isinstance(x_recon, tuple) and not return_ids:
@@ -1002,32 +1037,54 @@ class LatentDiffusion(DDPM):
         return mean_flat(kl_prior) / np.log(2.0)
 
     def p_losses(self, x_start, cond, t, noise=None):
+        # JHY: NOTE: 在训练或验证扩散模型时计算损失的核心部分
+
+        # 如果没有提供噪声（noise=None），则使用 torch.randn_like(x_start) 生成与 x_start 形状相同的标准正态分布噪声。
+        # default 是一个帮助函数，用于处理可选参数的默认值。
         noise = default(noise, lambda: torch.randn_like(x_start))
+
+        # 调用 q_sample 方法，将原始图像 x_start 添加噪声 noise，并按照当前时间步 t 扩散得到噪声图像 x_noisy。
+        # 这一步模拟了扩散过程中的噪声扰动。
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+
+        # 应用模型
         model_output = self.apply_model(x_noisy, t, cond)
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
 
+        # 这里的 parameterization 决定了目标 target 是什么
         if self.parameterization == "x0":
+            # 如果 parameterization 为 "x0"，目标是原始图像 x_start。这意味着模型的任务是直接预测去噪后的图像。
             target = x_start
         elif self.parameterization == "eps":
+            # 如果 parameterization 为 "eps"，目标是噪声 noise。这意味着模型的任务是预测添加到图像上的噪声。
             target = noise
         else:
             raise NotImplementedError()
 
+        # 计算出的损失在 [1, 2, 3] 维度（即通道、高度、宽度）上取平均值，得到每张图像的损失。
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
+        # 处理可学习的 log variance
+        # logvar_t：从模型的 logvar 参数中提取对应时间步 t 的 log variance，并将其转换为当前设备的张量
         logvar_t = self.logvar[t].to(self.device)
+        # loss：通过计算 (loss_simple / torch.exp(logvar_t)) + logvar_t，调整 loss_simple，使得损失能够根据 log variance 动态调整。
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
         # loss = loss_simple / torch.exp(self.logvar) + self.logvar
+
+        # 更新带有 log variance 的损失
+        # 可学习的 logvar：如果模型设置为 learn_logvar，则在损失字典中更新带有 log variance 调整的损失 loss_gamma 和当前的 logvar 平均值。
         if self.learn_logvar:
             loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
             loss_dict.update({'logvar': self.logvar.data.mean()})
 
+        # 加权损失：使用 l_simple_weight 对损失进行加权，并取平均值。
         loss = self.l_simple_weight * loss.mean()
 
+        # 计算可变下界损失（VLB）
+        # 计算变分下界损失（VLB），这是一种常用于生成模型的损失，用于衡量模型的生成质量。它通过时间步 t 上的权重 lvlb_weights 进行加权，然后加入到最终损失中。
         loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
@@ -1412,6 +1469,7 @@ class LatentDiffusion(DDPM):
             params = params + list(self.cc_projection.parameters())
             print('========== optimizing for cc projection weight ==========')
 
+        # JHY: NOTE: cc_projection's LR is 10 times than normal
         opt = torch.optim.AdamW([{"params": self.model.parameters(), "lr": lr},
                                 {"params": self.cc_projection.parameters(), "lr": 10. * lr}], lr=lr)
         if self.use_scheduler:

@@ -255,19 +255,32 @@ class ObjaverseData(Dataset):
         return np.array([theta, azimuth, z])
 
     def get_T(self, target_RT, cond_RT):
+        # JHY: NOTE: 用于计算两个相机姿态（target_RT 和 cond_RT）之间的位移向量 d_T。
+        # 这种位移向量通常用于计算两个不同视角之间的相对位置和角度变化。
+
+        # target_RT 和 cond_RT：分别表示目标视角和条件视角的 4x4 位姿矩阵（通常是齐次变换矩阵）。
+        # 旋转矩阵 R：提取 target_RT 和 cond_RT 的左上角 3x3 部分，代表旋转部分。
+        # 平移向量 T：提取 target_RT 和 cond_RT 的最后一列，代表平移部分。
         R, T = target_RT[:3, :3], target_RT[:, -1]
         T_target = -R.T @ T
 
         R, T = cond_RT[:3, :3], cond_RT[:, -1]
         T_cond = -R.T @ T
 
+        # 将平移向量T转换为球坐标系
+        # 球坐标系通常由以下三个参数组成：
+        # theta：极角（与 z 轴的夹角）。
+        # azimuth：方位角（在 xy 平面的投影与 x 轴的夹角）。
+        # z：径向距离（从原点到该点的距离）。
         theta_cond, azimuth_cond, z_cond = self.cartesian_to_spherical(T_cond[None, :])
         theta_target, azimuth_target, z_target = self.cartesian_to_spherical(T_target[None, :])
         
+        # 计算视角之间的差异
         d_theta = theta_target - theta_cond
         d_azimuth = (azimuth_target - azimuth_cond) % (2 * math.pi)
         d_z = z_target - z_cond
         
+        # 生成位移向量 d_T
         d_T = torch.tensor([d_theta.item(), math.sin(d_azimuth.item()), math.cos(d_azimuth.item()), d_z.item()])
         return d_T
 
